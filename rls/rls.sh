@@ -1,8 +1,6 @@
 #!/opt/homebrew/Cellar/bash/5.2.37/bin/bash
 
-target_dir="/Users/m.ugryumov/study/voenka/rls/GenTargets/Targets"
-db_file="targets.db"
-LOG_FILE="rls.log"
+BASE="/Users/m.ugryumov/study/voenka/pro"
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -26,20 +24,42 @@ parse_args() {
         echo "Использование: $0 --n <value> --x <value> --y <value> --azimuth <value> --view_angle <value> --radius <value>"
         exit 1
     fi
-
-    echo "В $(date +"%T") запущена РЛС-$rls_number с параметрами: x=$rls_x, y=$rls_y, azimuth=$rls_azimuth, view_angle=$rls_view_angle, radius=$rls_radius" >> "$LOG_FILE"
-
-    rls_x=$(( rls_x * 1000 ))
-    rls_y=$(( rls_y * 1000 ))
-    rls_view_angle=$(( rls_view_angle / 2 ))
-    rls_radius=$(( rls_radius * 1000 ))
 }
 
 parse_args "$@"
 
+TARGETS_DIR="$BASE/GenTargets/Targets"
+MESSAGES_DIR="$BASE/Messages"
+STORAGE_DIR="$BASE/rls/storage"
+DB_FILE="$STORAGE_DIR/rls_$rls_number.db"
+
+declare -A prev_coords
+mkdir -p "$STORAGE_DIR"
+messages_sent=0
+
+# Инициализация базы данных SQLite
+initialize_db() {
+    sqlite3 "$DB_FILE" <<EOF
+DROP TABLE IF EXISTS processed_files;
+CREATE TABLE IF NOT EXISTS processed_files (
+    filename TEXT PRIMARY KEY
+);
+EOF
+}
+
+initialize_db
+
+echo "$(date +"%T") $rls_number $rls_x, $rls_y, $rls_azimuth, $rls_view_angle, $rls_radius" >> "${MESSAGES_DIR}/rls_${rls_number}_start_${messages_sent}"
+messages_sent=$(( messages_sent + 1 ))
+
+rls_x=$(( rls_x * 1000 ))
+rls_y=$(( rls_y * 1000 ))
+rls_view_angle=$(( rls_view_angle / 2 ))
+rls_radius=$(( rls_radius * 1000 ))
+
 # Функция для выполнения SQL-запросов
 query_db() {
-    sqlite3 "$db_file" "$1"
+    sqlite3 "$DB_FILE" "$1"
 }
 
 # Функция для получения ID цели из имени файла
@@ -153,37 +173,37 @@ get_target_type() {
 # Основной цикл скрипта
 while true; do
     # Получение списка файлов в директории
-    target_files=($(find "$target_dir" -type f))
+    target_files=($(find "$TARGETS_DIR" -type f))
 
     for target_file in "${target_files[@]}"; do
         filename="$(basename "$target_file")"
 
-        # Проверка, обработан ли файл
-        if [ $(query_db "SELECT COUNT(*) FROM processed_files WHERE filename='$filename';") -gt 0 ]; then
+        if [[ $(query_db "SELECT COUNT(*) FROM processed_files WHERE filename='$filename';") -gt 0 ]]; then
             continue
         fi
 
-        # Добавляем файл в обработанные
         query_db "INSERT INTO processed_files (filename) VALUES ('$filename');"
 
-        # Извлечение координат из файла
         read -r _ current_x _ current_y < "$target_file"
 
-        # Проверка попадания цели в сектор обзора РЛС
         if is_target_in_view "$current_x" "$current_y" "$rls_x" "$rls_y" "$rls_azimuth" "$rls_view_angle" "$rls_radius"; then
             time=$(date +"%T")
             target_id=$(get_target_id "$filename")
-            IFS='|' read -r prev_x prev_y <<< "$(query_db "SELECT x, y FROM targets WHERE id='$target_id';")"
 
-            if [ -z "$prev_x" ]; then
-                # query_db "INSERT INTO targets (id, x, y, updated_at) VALUES ('$target_id', $current_x, $current_y, CURRENT_TIMESTAMP);"
-                echo "В $time обнаружена цель ID:$target_id с координатами $current_x $current_y" >> "$LOG_FILE"
+            if [[ ! -v prev_coords[$target_id] ]]; then
+                echo "first: $filename"
+                echo "$time $target_id $current_x $current_y" >> "${MESSAGES_DIR}/rls_${rls_number}_detect_${messages_sent}" 
             else
+                echo "second: $filename"
+                prev_x=$(echo "${prev_coords[$target_id]}" | cut -d ' ' -f 1)
+                prev_y=$(echo "${prev_coords[$target_id]}" | cut -d ' ' -f 2)
                 speed=$(get_target_speed "$current_x" "$current_y" "$prev_x" "$prev_y")
                 type=$(get_target_type "$speed")
-                # query_db "UPDATE targets SET x=$current_x, y=$current_y, speed=$speed, target_type='$type', updated_at=CURRENT_TIMESTAMP WHERE id='$target_id';"
-                echo "В $time цель ID:$target_id типа '$type' движется со скоростью ${speed} м/с" >> "$LOG_FILE"
+                echo "$time $target_id '$type' $speed" >> "${MESSAGES_DIR}/rls_${rls_number}_update_${messages_sent}"
             fi
+
+            prev_coords[$target_id]="$current_x $current_y"
+            messages_sent=$(( messages_sent + 1 ))
         fi
     done
 
